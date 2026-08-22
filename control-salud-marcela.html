@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Control de salud — Marcela Montoya</title>
+<link rel="icon" href="data:,">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Oswald:wght@300;400;500;600;700&display=swap');
+  body { background:#0a0a0a; margin:0; }
+  .font-display { font-family:'Bebas Neue', sans-serif; }
+  .font-body { font-family:'Oswald', sans-serif; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const MEDS = [
+  { id: "levotiroxina", name: "Levotiroxina", dose: "100mg", scheduled: "06:00", note: "En ayunas, todos los días" },
+  { id: "enalapril", name: "Enalapril", dose: "10mg", scheduled: null, note: "Sin hora fija" },
+];
+
+const STORAGE_KEY = "salud-marcela";
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const nowTime = () => new Date().toTimeString().slice(0, 5);
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+function classifyBP(sys, dia) {
+  if (sys >= 180 || dia >= 120) return { label: "Crisis hipertensiva", color: "#ef4444" };
+  if (sys >= 140 || dia >= 90) return { label: "Hipertensión etapa 2", color: "#f97316" };
+  if (sys >= 130 || dia >= 80) return { label: "Hipertensión etapa 1", color: "#f59e0b" };
+  if (sys >= 120) return { label: "Elevada", color: "#eab308" };
+  return { label: "Normal", color: "#4ade80" };
+}
+
+function extractNumbers(text) {
+  return (text.match(/\d+/g) || []).map(Number);
+}
+
+// ---------- persistence (localStorage — this is a standalone page, not a Claude artifact) ----------
+function useHealthData() {
+  const [data, setData] = useState({ bp: [], meds: [], exercise: [] });
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) setData(JSON.parse(raw));
+    } catch (e) {
+      console.error("No se pudo leer el almacenamiento local", e);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
+  const persist = useCallback((next) => {
+    setData(next);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {
+      console.error("No se pudo guardar", e);
+    }
+  }, []);
+
+  return { data, persist, loaded };
+}
+
+// ---------- voice input ----------
+function useVoice(onFinal) {
+  const [listening, setListening] = useState(false);
+  const supported = typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition);
+
+  const start = useCallback(() => {
+    if (!supported) return;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const rec = new SR();
+    rec.lang = "es-MX";
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+    rec.onresult = (e) => onFinal(e.results[0][0].transcript);
+    rec.onend = () => setListening(false);
+    rec.onerror = () => setListening(false);
+    setListening(true);
+    rec.start();
+  }, [supported, onFinal]);
+
+  return { start, listening, supported };
+}
+
+function VoiceButton({ onFinal, title }) {
+  const { start, listening, supported } = useVoice(onFinal);
+  if (!supported) return null;
+  return (
+    <button
+      type="button"
+      onClick={start}
+      title={title || "Dictar por voz"}
+      className={"shrink-0 flex items-center justify-center w-10 h-10 rounded-full border transition-colors " +
+        (listening ? "bg-orange-500 border-orange-400 animate-pulse" : "bg-neutral-800 border-neutral-600 hover:border-orange-400")}
+    >
+      <span style={{ fontSize: 16 }}>🎤</span>
+    </button>
+  );
+}
+
+// ---------- shared UI ----------
+function SectionTitle({ emoji, children }) {
+  return (
+    <div className="flex items-center gap-2 mb-4">
+      <span style={{ fontSize: 20 }}>{emoji}</span>
+      <h2 className="text-2xl tracking-wide font-display" style={{ color: "#f5a623" }}>{children}</h2>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="flex flex-col gap-1 text-xs uppercase tracking-wider text-neutral-400 font-body">
+      {label}
+      {children}
+    </label>
+  );
+}
+
+const inputCls = "bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-neutral-100 focus:outline-none focus:border-orange-400 text-sm";
+
+// simple dependency-free SVG line chart for systolic/diastolic trend
+function BPChart({ points }) {
+  if (points.length < 2) return null;
+  const w = 600, h = 180, pad = 30;
+  const xs = points.map((_, i) => pad + (i * (w - 2 * pad)) / (points.length - 1));
+  const yMin = 50, yMax = 190;
+  const y = (v) => h - pad - ((v - yMin) / (yMax - yMin)) * (h - 2 * pad);
+  const pathFor = (key) => points.map((p, i) => `${i === 0 ? "M" : "L"} ${xs[i]} ${y(p[key])}`).join(" ");
+  const refY = (v) => y(v);
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-full">
+      <line x1={pad} x2={w - pad} y1={refY(120)} y2={refY(120)} stroke="#4ade80" strokeDasharray="4 4" strokeWidth="1" />
+      <line x1={pad} x2={w - pad} y1={refY(80)} y2={refY(80)} stroke="#4ade80" strokeDasharray="4 4" strokeWidth="1" />
+      <path d={pathFor("sys")} fill="none" stroke="#f5a623" strokeWidth="2" />
+      <path d={pathFor("dia")} fill="none" stroke="#60a5fa" strokeWidth="2" />
+      {points.map((p, i) => (
+        <React.Fragment key={i}>
+          <circle cx={xs[i]} cy={y(p.sys)} r="3" fill="#f5a623" />
+          <circle cx={xs[i]} cy={y(p.dia)} r="3" fill="#60a5fa" />
+        </React.Fragment>
+      ))}
+    </svg>
+  );
+}
+
+// ---------- BP tab ----------
+function BPTab({ data, persist }) {
+  const [date, setDate] = useState(todayStr());
+  const [time, setTime] = useState(nowTime());
+  const [sys, setSys] = useState("");
+  const [dia, setDia] = useState("");
+  const [pulse, setPulse] = useState("");
+  const [notes, setNotes] = useState("");
+
+  const handleVoiceReading = useCallback((transcript) => {
+    const nums = extractNumbers(transcript);
+    if (nums[0] !== undefined) setSys(String(nums[0]));
+    if (nums[1] !== undefined) setDia(String(nums[1]));
+    if (nums[2] !== undefined) setPulse(String(nums[2]));
+  }, []);
+  const handleVoiceNotes = useCallback((t) => setNotes(t), []);
+
+  const save = () => {
+    if (!sys || !dia) return;
+    const entry = { id: uid(), date, time, sys: Number(sys), dia: Number(dia), pulse: pulse ? Number(pulse) : null, notes: notes.trim() };
+    persist({ ...data, bp: [entry, ...data.bp] });
+    setSys(""); setDia(""); setPulse(""); setNotes("");
+    setDate(todayStr()); setTime(nowTime());
+  };
+
+  const sorted = [...data.bp].sort((a, b) => (a.date + a.time > b.date + b.time ? -1 : 1));
+  const latest = sorted[0];
+  const chartPoints = [...sorted].reverse().slice(-20);
+
+  return (
+    <div>
+      <SectionTitle emoji="🩺">Presión arterial</SectionTitle>
+
+      {latest && (
+        <div className="mb-5 p-4 rounded-lg border border-neutral-700 bg-neutral-900/60 flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <div className="text-3xl font-display" style={{ color: "#f5f5f5" }}>
+              {latest.sys}/{latest.dia} <span className="text-base text-neutral-500">mmHg</span>
+            </div>
+            <div className="text-xs text-neutral-500 font-body">
+              {latest.date} · {latest.time} {latest.pulse ? `· pulso ${latest.pulse}` : ""}
+            </div>
+          </div>
+          <span className="text-xs px-3 py-1 rounded-full font-semibold font-body"
+            style={{ backgroundColor: classifyBP(latest.sys, latest.dia).color + "22", color: classifyBP(latest.sys, latest.dia).color }}>
+            {classifyBP(latest.sys, latest.dia).label}
+          </span>
+        </div>
+      )}
+
+      <div className="p-4 rounded-lg border border-neutral-800 bg-neutral-900/40 mb-6">
+        <div className="flex items-end gap-3 mb-3 flex-wrap">
+          <Field label="Fecha"><input type="date" className={inputCls + " w-36"} value={date} onChange={(e) => setDate(e.target.value)} /></Field>
+          <Field label="Hora"><input type="time" className={inputCls + " w-28"} value={time} onChange={(e) => setTime(e.target.value)} /></Field>
+          <Field label="Sistólica"><input className={inputCls + " w-24"} inputMode="numeric" value={sys} onChange={(e) => setSys(e.target.value)} placeholder="120" /></Field>
+          <Field label="Diastólica"><input className={inputCls + " w-24"} inputMode="numeric" value={dia} onChange={(e) => setDia(e.target.value)} placeholder="80" /></Field>
+          <Field label="Pulso (opcional)"><input className={inputCls + " w-24"} inputMode="numeric" value={pulse} onChange={(e) => setPulse(e.target.value)} placeholder="72" /></Field>
+          <VoiceButton title="Di los tres números: sistólica, diastólica, pulso" onFinal={handleVoiceReading} />
+        </div>
+        <div className="flex items-end gap-3 mb-4">
+          <Field label="Notas (opcional)"><input className={inputCls + " w-64"} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Ej. después de comer" /></Field>
+          <VoiceButton title="Dictar nota" onFinal={handleVoiceNotes} />
+        </div>
+        <button onClick={save} disabled={!sys || !dia}
+          className="flex items-center gap-2 px-4 py-2 rounded font-semibold text-sm disabled:opacity-40 font-body"
+          style={{ backgroundColor: "#f5a623", color: "#0a0a0a" }}>
+          ➕ Registrar lectura
+        </button>
+      </div>
+
+      {chartPoints.length > 1 && (
+        <div className="p-4 rounded-lg border border-neutral-800 bg-neutral-900/40 mb-6" style={{ height: 200 }}>
+          <BPChart points={chartPoints} />
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {sorted.slice(0, 8).map((r) => (
+          <div key={r.id} className="flex items-center justify-between text-sm p-2 rounded border border-neutral-800 font-body flex-wrap gap-1">
+            <span className="text-neutral-300">{r.date} · {r.time}</span>
+            <span className="text-neutral-100">{r.sys}/{r.dia}{r.pulse ? ` · ${r.pulse} lpm` : ""}</span>
+            <span style={{ color: classifyBP(r.sys, r.dia).color }} className="text-xs">{classifyBP(r.sys, r.dia).label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Meds tab ----------
+function MedsTab({ data, persist }) {
+  const [selectedDate, setSelectedDate] = useState(todayStr());
+  const isToday = selectedDate === todayStr();
+  const todaysMeds = data.meds.filter((m) => m.date === selectedDate);
+
+  const markTaken = (medId, time) => {
+    const filtered = data.meds.filter((m) => !(m.date === selectedDate && m.medId === medId));
+    persist({ ...data, meds: [...filtered, { id: uid(), date: selectedDate, medId, time }] });
+  };
+  const unmark = (medId) => persist({ ...data, meds: data.meds.filter((m) => !(m.date === selectedDate && m.medId === medId)) });
+
+  const last7 = [...Array(7)].map((_, i) => { const d = new Date(); d.setDate(d.getDate() - i); return d.toISOString().slice(0, 10); });
+  const adherence = MEDS.map((med) => ({ ...med, takenDays: last7.filter((d) => data.meds.some((m) => m.date === d && m.medId === med.id)).length }));
+
+  return (
+    <div>
+      <SectionTitle emoji="💊">Medicamentos — {isToday ? "hoy" : selectedDate}</SectionTitle>
+      <Field label="Ver / registrar día">
+        <input type="date" className={inputCls + " w-36 mb-4"} value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} max={todayStr()} />
+      </Field>
+      <div className="space-y-3 mb-8">
+        {MEDS.map((med) => {
+          const entry = todaysMeds.find((m) => m.medId === med.id);
+          return (
+            <div key={med.id} className="p-4 rounded-lg border border-neutral-800 bg-neutral-900/40 flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <div className="text-lg font-display" style={{ color: "#f5f5f5", letterSpacing: "0.5px" }}>
+                  {med.name} <span className="text-neutral-500 text-sm">{med.dose}</span>
+                </div>
+                <div className="text-xs text-neutral-500 font-body">{med.scheduled ? `⏰ ${med.scheduled} · ` : ""}{med.note}</div>
+              </div>
+              {entry ? (
+                <button onClick={() => unmark(med.id)} className="flex items-center gap-2 px-3 py-2 rounded text-sm font-semibold font-body"
+                  style={{ backgroundColor: "#4ade8022", color: "#4ade80" }}>
+                  ✔ Tomada · {entry.time}
+                </button>
+              ) : (
+                <button onClick={() => markTaken(med.id, isToday ? nowTime() : (med.scheduled || "—"))}
+                  className="px-4 py-2 rounded text-sm font-semibold font-body" style={{ backgroundColor: "#f5a623", color: "#0a0a0a" }}>
+                  Marcar tomada
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <h3 className="text-sm uppercase tracking-wider text-neutral-400 mb-2 font-body">Cumplimiento — últimos 7 días</h3>
+      <div className="space-y-2">
+        {adherence.map((med) => (
+          <div key={med.id} className="flex items-center gap-3">
+            <span className="w-32 text-sm text-neutral-300 font-body">{med.name}</span>
+            <div className="flex-1 h-2 bg-neutral-800 rounded overflow-hidden">
+              <div className="h-full" style={{ width: `${(med.takenDays / 7) * 100}%`, backgroundColor: "#f5a623" }} />
+            </div>
+            <span className="text-xs text-neutral-500 w-10 text-right">{med.takenDays}/7</span>
+          </div>
+        ))}
+      </div>
+      {adherence.some((m) => m.takenDays < 5) && (
+        <div className="mt-4 flex items-start gap-2 text-xs text-neutral-400 p-3 rounded border border-neutral-800 font-body">
+          <span>⚠️</span>
+          Si hay varios días sin marcar como tomados, confirma con Marcela y, si el olvido es frecuente, coméntalo con su médico.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Exercise tab ----------
+function ExerciseTab({ data, persist }) {
+  const [date, setDate] = useState(todayStr());
+  const [type, setType] = useState("");
+  const [minutes, setMinutes] = useState("");
+
+  const handleVoiceType = useCallback((t) => setType(t), []);
+  const handleVoiceMinutes = useCallback((t) => { const n = extractNumbers(t)[0]; if (n !== undefined) setMinutes(String(n)); }, []);
+
+  const save = () => {
+    if (!type.trim()) return;
+    const entry = { id: uid(), date, time: nowTime(), type: type.trim(), minutes: minutes ? Number(minutes) : null };
+    persist({ ...data, exercise: [entry, ...data.exercise] });
+    setType(""); setMinutes(""); setDate(todayStr());
+  };
+
+  const sorted = [...data.exercise].sort((a, b) => (a.date + a.time > b.date + b.time ? -1 : 1));
+
+  return (
+    <div>
+      <SectionTitle emoji="🏃">Actividad física ligera</SectionTitle>
+      <div className="p-4 rounded-lg border border-neutral-800 bg-neutral-900/40 mb-6">
+        <div className="flex items-end gap-3 mb-3 flex-wrap">
+          <Field label="Fecha"><input type="date" className={inputCls + " w-36"} value={date} onChange={(e) => setDate(e.target.value)} /></Field>
+          <Field label="Actividad"><input className={inputCls + " w-48"} value={type} onChange={(e) => setType(e.target.value)} placeholder="Ej. caminata" /></Field>
+          <VoiceButton title="Dictar actividad" onFinal={handleVoiceType} />
+          <Field label="Minutos"><input className={inputCls + " w-24"} inputMode="numeric" value={minutes} onChange={(e) => setMinutes(e.target.value)} placeholder="20" /></Field>
+          <VoiceButton title="Dictar duración" onFinal={handleVoiceMinutes} />
+        </div>
+        <button onClick={save} disabled={!type.trim()}
+          className="flex items-center gap-2 px-4 py-2 rounded font-semibold text-sm disabled:opacity-40 font-body"
+          style={{ backgroundColor: "#f5a623", color: "#0a0a0a" }}>
+          ➕ Registrar actividad
+        </button>
+      </div>
+      <div className="space-y-2">
+        {sorted.slice(0, 10).map((r) => (
+          <div key={r.id} className="flex items-center justify-between text-sm p-2 rounded border border-neutral-800 font-body flex-wrap gap-1">
+            <span className="text-neutral-300">{r.date} · {r.time}</span>
+            <span className="text-neutral-100">{r.type}</span>
+            <span className="text-neutral-500">{r.minutes ? `${r.minutes} min` : "—"}</span>
+          </div>
+        ))}
+        {sorted.length === 0 && <p className="text-sm text-neutral-500 font-body">Aún no hay actividad registrada.</p>}
+      </div>
+    </div>
+  );
+}
+
+// ---------- App ----------
+function App() {
+  const { data, persist, loaded } = useHealthData();
+  const [tab, setTab] = useState("bp");
+  const tabs = [
+    { id: "bp", label: "Presión", emoji: "🩺" },
+    { id: "meds", label: "Medicamentos", emoji: "💊" },
+    { id: "exercise", label: "Ejercicio", emoji: "🏃" },
+  ];
+
+  return (
+    <div className="min-h-screen w-full" style={{ backgroundColor: "#0a0a0a" }}>
+      <div className="max-w-2xl mx-auto px-4 py-6">
+        <div className="mb-6">
+          <div className="text-xs uppercase tracking-[0.2em] text-neutral-500 font-body">Control de salud</div>
+          <h1 className="text-4xl font-display" style={{ color: "#f5f5f5", letterSpacing: "1px" }}>Marcela Montoya</h1>
+        </div>
+
+        <div className="flex gap-2 mb-6 border-b border-neutral-800">
+          {tabs.map((t) => {
+            const active = tab === t.id;
+            return (
+              <button key={t.id} onClick={() => setTab(t.id)}
+                className="flex items-center gap-2 px-3 py-2 text-sm border-b-2 -mb-px transition-colors font-body"
+                style={{ borderColor: active ? "#f5a623" : "transparent", color: active ? "#f5a623" : "#737373" }}>
+                <span>{t.emoji}</span> {t.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {!loaded ? (
+          <p className="text-neutral-500 text-sm font-body">Cargando...</p>
+        ) : (
+          <React.Fragment>
+            {tab === "bp" && <BPTab data={data} persist={persist} />}
+            {tab === "meds" && <MedsTab data={data} persist={persist} />}
+            {tab === "exercise" && <ExerciseTab data={data} persist={persist} />}
+          </React.Fragment>
+        )}
+
+        <p className="mt-10 text-[11px] text-neutral-600 leading-relaxed font-body">
+          Herramienta de seguimiento personal, no sustituye indicación médica. Ante cambios importantes en las lecturas
+          de presión, consulta al médico de Marcela. El dictado por voz usa el reconocimiento de voz del navegador
+          (funciona mejor en Chrome); revisa siempre el dato antes de guardar. Los datos se guardan solo en este
+          navegador y dispositivo (almacenamiento local) — no se sincronizan entre celular y computadora.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
